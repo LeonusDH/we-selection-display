@@ -182,15 +182,14 @@ public final class SelectionShapes {
             return;
         }
         // У соседних треугольников общие рёбра — убираем дубликаты.
-        final Set<String> seen = new HashSet<>();
+        // Vector3 — record, поэтому неупорядоченная пара вершин сравнивается как Set.
+        final Set<Set<Vector3>> seen = new HashSet<>();
         for (final Triangle triangle : triangles) {
             for (int i = 0; i < 3; i++) {
                 final Vector3 a = triangle.getVertex(i);
                 final Vector3 b = triangle.getVertex((i + 1) % 3);
-                final String ka = a.x() + "," + a.y() + "," + a.z();
-                final String kb = b.x() + "," + b.y() + "," + b.z();
-                final String key = ka.compareTo(kb) < 0 ? ka + "|" + kb : kb + "|" + ka;
-                if (seen.add(key)) {
+                // Set.of бросает исключение на одинаковых элементах, а вырожденное ребро и не нужно.
+                if (!a.equals(b) && seen.add(Set.of(a, b))) {
                     out.add(new Line(a.x() + 0.5, a.y() + 0.5, a.z() + 0.5,
                         b.x() + 0.5, b.y() + 0.5, b.z() + 0.5, LineStyle.CONVEX));
                 }

@@ -3,9 +3,10 @@ package dev.selviz.render;
 import dev.selviz.Settings;
 import dev.selviz.geometry.Line;
 import dev.selviz.geometry.LineStyle;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import org.spongepowered.api.ResourceKey;
 import org.spongepowered.api.Sponge;
-import org.spongepowered.api.block.BlockState;
 import org.spongepowered.api.entity.living.player.server.ServerPlayer;
 import org.spongepowered.math.vector.Vector3d;
 
@@ -25,8 +26,8 @@ import java.util.UUID;
  * к нужному набору отрезков.
  *
  * <p>Обновление дифференциальное: пакеты уходят только для появившихся и исчезнувших
- * кусков. Поэтому при движении игрока или растягивании выделения перерисовывается
- * лишь то, что изменилось.</p>
+ * кусков, одной связкой на игрока. Поэтому при движении игрока или растягивании
+ * выделения перерисовывается лишь то, что изменилось.</p>
  *
  * <p>Все методы вызываются из главного потока сервера.</p>
  */
@@ -34,17 +35,17 @@ public final class SelectionRenderer {
 
     private final Map<UUID, View> views = new HashMap<>();
     private Settings settings;
-    private Map<LineStyle, BlockState> blocks = new EnumMap<>(LineStyle.class);
+    private Map<LineStyle, LineLook> looks = new EnumMap<>(LineStyle.class);
 
-    public SelectionRenderer(final Settings settings, final Map<LineStyle, BlockState> blocks) {
-        this.apply(settings, blocks);
+    public SelectionRenderer(final Settings settings, final Map<LineStyle, LineLook> looks) {
+        this.apply(settings, looks);
     }
 
     /** Новые настройки: всё нарисованное убирается и при следующем обновлении рисуется заново. */
-    public void apply(final Settings settings, final Map<LineStyle, BlockState> blocks) {
+    public void apply(final Settings settings, final Map<LineStyle, LineLook> looks) {
         this.hideAll();
         this.settings = settings;
-        this.blocks = new EnumMap<>(blocks);
+        this.looks = new EnumMap<>(looks);
     }
 
     /**
@@ -62,44 +63,47 @@ public final class SelectionRenderer {
         view.world = world;
 
         final Set<Line> wanted = this.visibleSegments(player, lines);
+        final List<Packet<? super ClientGamePacketListener>> packets = new ArrayList<>();
 
-        final List<Integer> toRemove = new ArrayList<>();
+        final List<Integer> gone = new ArrayList<>();
         final Iterator<Map.Entry<Line, Integer>> it = view.sent.entrySet().iterator();
         while (it.hasNext()) {
             final Map.Entry<Line, Integer> entry = it.next();
             if (!wanted.contains(entry.getKey())) {
-                toRemove.add(entry.getValue());
+                gone.add(entry.getValue());
                 it.remove();
             }
         }
-        ClientDisplays.remove(player, toRemove);
+        ClientDisplays.remove(gone, packets);
 
         for (final Line line : wanted) {
             if (view.sent.containsKey(line)) {
                 continue;
             }
-            final BlockState block = this.blocks.get(line.style());
-            if (block == null) {
+            final LineLook look = this.looks.get(line.style());
+            if (look == null) {
                 continue;
             }
-            final int id = ClientDisplays.show(player, line, block, this.settings);
+            final int id = ClientDisplays.spawn(player, line, look, this.settings, packets);
             if (id >= 0) {
                 view.sent.put(line, id);
             }
         }
+
+        ClientDisplays.send(player, packets);
     }
 
     /** Убрать у игрока всё нарисованное. */
     public void hide(final ServerPlayer player) {
         final View view = this.views.remove(player.uniqueId());
         if (view != null) {
-            ClientDisplays.remove(player, view.sent.values());
+            hide(player, view);
         }
     }
 
     /**
      * Забыть, что игроку что-то отправлялось, не посылая пакетов. Для случаев,
-     * когда клиент уже сам выбросил сущности: выход, смена мира, респаун.
+     * когда клиент уже сам выбросил сущности: выход, смена мира.
      */
     public void forget(final UUID player) {
         this.views.remove(player);
@@ -107,47 +111,40 @@ public final class SelectionRenderer {
 
     public void hideAll() {
         for (final Map.Entry<UUID, View> entry : this.views.entrySet()) {
-            Sponge.server().player(entry.getKey())
-                .ifPresent(player -> ClientDisplays.remove(player, entry.getValue().sent.values()));
+            Sponge.server().player(entry.getKey()).ifPresent(player -> hide(player, entry.getValue()));
         }
         this.views.clear();
+    }
+
+    private static void hide(final ServerPlayer player, final View view) {
+        final List<Packet<? super ClientGamePacketListener>> packets = new ArrayList<>(1);
+        ClientDisplays.remove(view.sent.values(), packets);
+        ClientDisplays.send(player, packets);
     }
 
     /** Куски отрезков в радиусе отрисовки, не больше лимита, ближние в приоритете. */
     private Set<Line> visibleSegments(final ServerPlayer player, final List<Line> lines) {
         final Vector3d eye = player.position();
         final double radius = this.effectiveRadius(player);
-        final double radiusSq = radius * radius;
-        final List<Line> candidates = new ArrayList<>();
+        final List<Line> pieces = new ArrayList<>();
         for (final Line line : lines) {
-            if (line.distanceSquared(eye.x(), eye.y(), eye.z()) > radiusSq) {
-                continue;
-            }
-            for (final Line piece : line.split(this.settings.segmentLength)) {
-                if (piece.distanceSquared(eye.x(), eye.y(), eye.z()) <= radiusSq) {
-                    candidates.add(piece);
-                }
-            }
+            line.splitNear(this.settings.segmentLength, eye.x(), eye.y(), eye.z(), radius, pieces);
         }
-        if (candidates.size() > this.settings.maxEntitiesPerPlayer) {
-            candidates.sort(Comparator.comparingDouble(l -> l.distanceSquared(eye.x(), eye.y(), eye.z())));
-            return new HashSet<>(candidates.subList(0, Math.max(0, this.settings.maxEntitiesPerPlayer)));
+        if (pieces.size() > this.settings.maxEntitiesPerPlayer) {
+            pieces.sort(Comparator.comparingDouble(l -> l.distanceSquared(eye.x(), eye.y(), eye.z())));
+            return new HashSet<>(pieces.subList(0, this.settings.maxEntitiesPerPlayer));
         }
-        return new HashSet<>(candidates);
+        return new HashSet<>(pieces);
     }
 
-    /**
-     * Радиус не больше, чем видит клиент: сущность в выгруженном у клиента чанке он
-     * удаляет сам, а мы бы считали её показанной.
-     */
+    /** Радиус не больше дальности прорисовки игрока: дальше линии всё равно не видны. */
     private double effectiveRadius(final ServerPlayer player) {
         int chunks = player.world().properties().viewDistance();
         final int client = player.viewDistance().get();
         if (client > 0) {
             chunks = Math.min(chunks, client);
         }
-        final double byView = Math.max(1, chunks - 1) * 16.0;
-        return Math.min(this.settings.renderRadius, byView);
+        return Math.min(this.settings.renderRadius, Math.max(1, chunks) * 16.0);
     }
 
     private static final class View {

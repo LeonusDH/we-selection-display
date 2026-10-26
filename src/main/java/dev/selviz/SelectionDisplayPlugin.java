@@ -8,6 +8,8 @@ import com.sk89q.worldedit.world.World;
 import dev.selviz.geometry.Line;
 import dev.selviz.geometry.LineStyle;
 import dev.selviz.geometry.SelectionShapes;
+import dev.selviz.render.ClientDisplays;
+import dev.selviz.render.LineLook;
 import dev.selviz.render.SelectionRenderer;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -39,6 +41,7 @@ import org.spongepowered.plugin.PluginContainer;
 import org.spongepowered.plugin.builtin.jvm.Plugin;
 
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -56,8 +59,10 @@ public final class SelectionDisplayPlugin {
     private SelectionRenderer renderer;
     private ScheduledTask task;
 
-    /** Игроки, переключившие показ в состояние, обратное enabled-by-default. */
-    private final Set<UUID> toggled = new HashSet<>();
+    /** Явный выбор игрока командой /selviz. Кого здесь нет — тем действует enabled-by-default. */
+    private final Map<UUID, Boolean> choices = new HashMap<>();
+    /** Игроки, для которых уже записана ошибка отрисовки: не спамим лог каждые несколько тиков. */
+    private final Set<UUID> failing = new HashSet<>();
 
     @Inject
     SelectionDisplayPlugin(final PluginContainer container, final Logger logger,
@@ -77,7 +82,10 @@ public final class SelectionDisplayPlugin {
     @Listener
     public void onServerStarted(final StartedEngineEvent<Server> event) {
         // Блоки разбираем здесь: на этапе конструирования реестры ещё не готовы.
-        this.renderer = new SelectionRenderer(this.settings, this.parseBlocks());
+        this.renderer = new SelectionRenderer(this.settings, this.parseLooks());
+        if (!ClientDisplays.glowColorSupported()) {
+            this.logger.warn("Glow color override is not available on this Minecraft version, glow outlines will be white");
+        }
         this.restartTask();
     }
 
@@ -92,12 +100,13 @@ public final class SelectionDisplayPlugin {
         }
     }
 
-    // При выходе, смене мира и респауне клиент сам выбрасывает все сущности —
+    // При выходе и смене мира клиент сам выбрасывает все сущности —
     // просто забываем, что отправляли, и при следующем обновлении шлём заново.
 
     @Listener
     public void onLeave(final ServerSideConnectionEvent.Leave event) {
         this.forget(event.player().uniqueId());
+        this.failing.remove(event.player().uniqueId());
     }
 
     @Listener
@@ -109,7 +118,11 @@ public final class SelectionDisplayPlugin {
 
     @Listener
     public void onRespawn(final RespawnPlayerEvent.Post event) {
-        this.forget(event.entity().uniqueId());
+        // При респауне в том же мире клиент сохраняет свои сущности. Если забыть их здесь,
+        // следующее обновление нарисует копии, а старые линии останутся висеть навсегда.
+        if (!event.originalWorld().key().equals(event.destinationWorld().key())) {
+            this.forget(event.entity().uniqueId());
+        }
     }
 
     private void forget(final UUID player) {
@@ -126,7 +139,7 @@ public final class SelectionDisplayPlugin {
         }
         this.task = Sponge.server().scheduler().submit(Task.builder()
             .plugin(this.container)
-            .interval(Ticks.of(Math.max(1, this.settings.updateIntervalTicks)))
+            .interval(Ticks.of(this.settings.updateIntervalTicks))
             .execute(this::tick)
             .build());
     }
@@ -135,21 +148,23 @@ public final class SelectionDisplayPlugin {
         for (final ServerPlayer player : Sponge.server().onlinePlayers()) {
             try {
                 this.update(player);
+                this.failing.remove(player.uniqueId());
             } catch (final Exception e) {
                 // Одна ошибка не должна ронять задачу для всех.
-                this.logger.warn("Failed to draw selection for {}", player.name(), e);
-                this.renderer.hide(player);
+                if (this.failing.add(player.uniqueId())) {
+                    this.logger.warn("Failed to draw selection for {}", player.name(), e);
+                }
+                try {
+                    this.renderer.hide(player);
+                } catch (final Exception ignored) {
+                    this.renderer.forget(player.uniqueId());
+                }
             }
         }
     }
 
     private void update(final ServerPlayer player) {
-        if (!this.isEnabledFor(player.uniqueId())) {
-            this.renderer.hide(player);
-            return;
-        }
-
-        final List<Line> lines = this.selectionLines(player);
+        final List<Line> lines = this.isEnabledFor(player.uniqueId()) ? this.selectionLines(player) : List.of();
         if (lines.isEmpty()) {
             this.renderer.hide(player);
         } else {
@@ -160,11 +175,11 @@ public final class SelectionDisplayPlugin {
     /**
      * Рёбра выделения игрока в его текущем мире. Пустой список — рисовать нечего.
      *
-     * <p>Сессию ищем по имени игрока: так не нужна зависимость от worldedit-sponge
-     * (SpongeAdapter), достаточно worldedit-core.</p>
+     * <p>Достаточно worldedit-core: сессия ищется по UUID игрока, без SpongeAdapter.</p>
      */
     private List<Line> selectionLines(final ServerPlayer player) {
-        final LocalSession session = WorldEdit.getInstance().getSessionManager().findByName(player.name());
+        final LocalSession session = WorldEdit.getInstance().getSessionManager()
+            .getIfPresent(new SessionLookup(player.uniqueId(), player.name()));
         if (session == null) {
             return List.of();
         }
@@ -179,19 +194,12 @@ public final class SelectionDisplayPlugin {
     }
 
     private boolean isEnabledFor(final UUID player) {
-        return this.settings.enabledByDefault != this.toggled.contains(player);
-    }
-
-    private void setEnabled(final UUID player, final boolean enabled) {
-        if (enabled == this.settings.enabledByDefault) {
-            this.toggled.remove(player);
-        } else {
-            this.toggled.add(player);
-        }
+        return this.choices.getOrDefault(player, this.settings.enabledByDefault);
     }
 
     // ------------------------------------------------------------------ настройки
 
+    /** При ошибке чтения остаются прежние настройки (при старте — значения по умолчанию). */
     private void loadSettings() {
         try {
             this.configReference.load();
@@ -199,30 +207,58 @@ public final class SelectionDisplayPlugin {
             if (loaded == null) {
                 loaded = new Settings();
             }
+            final List<String> fixed = loaded.sanitize();
+            if (!fixed.isEmpty()) {
+                this.logger.warn("Config values out of range were adjusted: {}", String.join(", ", fixed));
+            }
             this.settings = loaded;
             // Записываем обратно, чтобы в файле появились все ключи с комментариями.
             this.configReference.node().set(Settings.class, loaded);
             this.configReference.save();
         } catch (final ConfigurateException e) {
-            this.logger.error("Could not load config, using defaults", e);
-            this.settings = new Settings();
+            this.logger.error("Could not load config, keeping previous settings", e);
         }
     }
 
-    private Map<LineStyle, BlockState> parseBlocks() {
-        final Map<LineStyle, BlockState> result = new EnumMap<>(LineStyle.class);
+    private Map<LineStyle, LineLook> parseLooks() {
+        final Settings.Styles defaultBlocks = new Settings().blocks;
+        final Settings.Styles defaultGlow = new Settings().glowColors;
+        final Map<LineStyle, LineLook> result = new EnumMap<>(LineStyle.class);
         for (final LineStyle style : LineStyle.values()) {
-            final String id = this.settings.blocks.get(style);
-            BlockState state;
-            try {
-                state = BlockState.fromString(id);
-            } catch (final Exception e) {
-                this.logger.warn("Unknown block '{}' for {} lines, falling back to white concrete", id, style);
-                state = BlockTypes.WHITE_CONCRETE.get().defaultState();
-            }
-            result.put(style, state);
+            result.put(style, new LineLook(
+                this.parseBlock(style, this.settings.blocks.get(style), defaultBlocks.get(style)),
+                this.parseColor(style, this.settings.glowColors.get(style), defaultGlow.get(style))));
         }
         return result;
+    }
+
+    private BlockState parseBlock(final LineStyle style, final String id, final String fallback) {
+        if (id != null) {
+            try {
+                return BlockState.fromString(id);
+            } catch (final RuntimeException e) {
+                this.logger.warn("Unknown block '{}' for {} lines, using {}", id, style, fallback);
+            }
+        }
+        try {
+            return BlockState.fromString(fallback);
+        } catch (final RuntimeException e) {
+            return BlockTypes.WHITE_CONCRETE.get().defaultState();
+        }
+    }
+
+    private int parseColor(final LineStyle style, final String hex, final String fallback) {
+        final String value = hex == null ? fallback : hex.trim();
+        try {
+            final String digits = value.startsWith("#") ? value.substring(1) : value;
+            if (digits.length() == 6) {
+                return Integer.parseInt(digits, 16);
+            }
+        } catch (final NumberFormatException ignored) {
+            // ниже
+        }
+        this.logger.warn("Invalid glow color '{}' for {} lines, using {}", value, style, fallback);
+        return Integer.parseInt(fallback, 16);
     }
 
     // ------------------------------------------------------------------ команды
@@ -243,7 +279,7 @@ public final class SelectionDisplayPlugin {
             .executor(ctx -> {
                 this.loadSettings();
                 if (this.renderer != null) {
-                    this.renderer.apply(this.settings, this.parseBlocks());
+                    this.renderer.apply(this.settings, this.parseLooks());
                     this.restartTask();
                 }
                 ctx.cause().audience().sendMessage(Component.text("Конфиг перечитан.", NamedTextColor.GREEN));
@@ -253,34 +289,25 @@ public final class SelectionDisplayPlugin {
 
         event.register(this.container, Command.builder()
             .shortDescription(Component.text("Включить/выключить показ выделения WorldEdit"))
-            .executor(ctx -> {
-                final ServerPlayer player = this.requirePlayer(ctx);
-                if (player == null) {
-                    return CommandResult.error(Component.text("Только для игроков."));
-                }
-                return this.setFor(ctx, !this.isEnabledFor(player.uniqueId()));
-            })
+            .executor(ctx -> this.setFor(ctx, null))
             .addChild(on, "on")
             .addChild(off, "off")
             .addChild(reload, "reload")
             .build(), "selviz", "wesel");
     }
 
-    private CommandResult setFor(final CommandContext ctx, final boolean enabled) {
-        final ServerPlayer player = this.requirePlayer(ctx);
-        if (player == null) {
+    /** @param enabled {@code null} — переключить */
+    private CommandResult setFor(final CommandContext ctx, final Boolean enabled) {
+        if (!(ctx.cause().root() instanceof ServerPlayer player)) {
             return CommandResult.error(Component.text("Только для игроков."));
         }
-        this.setEnabled(player.uniqueId(), enabled);
-        if (!enabled && this.renderer != null) {
+        final boolean value = enabled != null ? enabled : !this.isEnabledFor(player.uniqueId());
+        this.choices.put(player.uniqueId(), value);
+        if (!value && this.renderer != null) {
             this.renderer.hide(player);
         }
-        player.sendMessage(Component.text(enabled ? "Показ выделения включён." : "Показ выделения выключен.",
-            enabled ? NamedTextColor.GREEN : NamedTextColor.GRAY));
+        player.sendMessage(Component.text(value ? "Показ выделения включён." : "Показ выделения выключен.",
+            value ? NamedTextColor.GREEN : NamedTextColor.GRAY));
         return CommandResult.success();
-    }
-
-    private ServerPlayer requirePlayer(final CommandContext ctx) {
-        return ctx.cause().root() instanceof ServerPlayer player ? player : null;
     }
 }
