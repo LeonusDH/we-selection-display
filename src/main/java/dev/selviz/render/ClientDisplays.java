@@ -17,8 +17,8 @@ import org.spongepowered.api.data.Keys;
 import org.spongepowered.api.entity.EntityTypes;
 import org.spongepowered.api.entity.display.BlockDisplay;
 import org.spongepowered.api.entity.living.player.server.ServerPlayer;
+import org.spongepowered.api.util.Transform;
 import org.spongepowered.math.imaginary.Quaterniond;
-import org.spongepowered.math.matrix.Matrix4d;
 import org.spongepowered.math.vector.Vector3d;
 
 import java.lang.reflect.Field;
@@ -71,7 +71,7 @@ public final class ClientDisplays {
         final BlockDisplay display = player.world().createEntity(EntityTypes.BLOCK_DISPLAY,
             new Vector3d(line.x1(), line.y1(), line.z1()));
         display.offer(Keys.BLOCK_STATE, look.block());
-        display.offer(Keys.MATRIX, matrix(dx / length, dy / length, dz / length, length, settings.lineThickness));
+        display.offer(Keys.TRANSFORM, transform(dx / length, dy / length, dz / length, length, settings.lineThickness));
         display.offer(Keys.VIEW_RANGE, settings.viewRange);
         if (settings.fullBright) {
             // Первый же ключ освещения выставляет оба канала: незаданный становится 15.
@@ -141,32 +141,32 @@ public final class ClientDisplays {
         return GLOW_COLOR != null;
     }
 
-    // ------------------------------------------------------------------ матрица
+    // ------------------------------------------------------------------ трансформация
 
     /**
-     * Модель block_display — единичный куб (0,0,0)–(1,1,1). Сначала сжимаем его в брусок
-     * (длина × толщина × толщина) и центрируем по сечению, потом поворачиваем ось +X
-     * в направление отрезка. Брусок выходит за концы на t/2, чтобы углы смыкались.
+     * Модель block_display — единичный куб (0,0,0)–(1,1,1). Нужная матрица:
      *
-     * <pre>M = R(+X → n) · T(-t/2, -t/2, -t/2) · S(L + t, t, t)</pre>
+     * <pre>M = R · T(-t/2, -t/2, -t/2) · S(L + t, t, t)</pre>
+     *
+     * <p>то есть сжать куб в брусок (длина × толщина × толщина), отцентровать по сечению
+     * и повернуть ось +X в направление отрезка n. Брусок выходит за концы на t/2,
+     * чтобы углы рамки смыкались.</p>
+     *
+     * <p>{@code Keys.MATRIX} появился только в Sponge API 12.1, а в 12.0 есть лишь
+     * {@code Keys.TRANSFORM}. Sponge строит из него {@code T(position) · R · S(scale)},
+     * а {@code R · T(c) = T(R·c) · R}, так что в position кладём {@code R·(-t/2, -t/2, -t/2)}.</p>
+     *
+     * <p>Поворот R = Ry(a) · Rz(e): сначала наклонить ось X вверх на угол e, потом
+     * развернуть вокруг Y на угол a. Это порядок Эйлера Y·X·Z, который использует
+     * Transform, с нулевым углом по X. Sponge при сборке инвертирует угол по Y
+     * ({@code fromAxesAnglesDeg(x, -y, z)}), поэтому в rotation передаём −a.</p>
      */
-    static Matrix4d matrix(final double nx, final double ny, final double nz, final double length, final double t) {
-        final Matrix4d scale = Matrix4d.createScaling(length + t, t, t, 1);
-        final Matrix4d center = Matrix4d.createTranslation(-t / 2, -t / 2, -t / 2);
-        return rotationFromX(nx, ny, nz).mul(center).mul(scale);
-    }
-
-    /** Поворот, переводящий ось +X в единичный вектор (nx, ny, nz). */
-    static Matrix4d rotationFromX(final double nx, final double ny, final double nz) {
-        if (nx > 1 - EPS) {
-            return Matrix4d.IDENTITY;
-        }
-        if (nx < -1 + EPS) {
-            return Matrix4d.createRotation(Quaterniond.fromAngleRadAxis(Math.PI, 0, 1, 0));
-        }
-        // Ось поворота = X × n = (0, -nz, ny), угол = acos(X · n) = acos(nx).
-        final double axisLen = Math.sqrt(ny * ny + nz * nz);
-        final Quaterniond q = Quaterniond.fromAngleRadAxis(Math.acos(nx), 0, -nz / axisLen, ny / axisLen);
-        return Matrix4d.createRotation(q);
+    static Transform transform(final double nx, final double ny, final double nz, final double length, final double t) {
+        final double e = Math.toDegrees(Math.atan2(ny, Math.sqrt(nx * nx + nz * nz)));
+        final double a = Math.toDegrees(Math.atan2(-nz, nx));
+        final Quaterniond rotation = Quaterniond.fromAngleDegAxis(a, Vector3d.UNIT_Y)
+            .mul(Quaterniond.fromAngleDegAxis(e, Vector3d.UNIT_Z));
+        final Vector3d offset = rotation.rotate(new Vector3d(-t / 2, -t / 2, -t / 2));
+        return Transform.of(offset, new Vector3d(0, -a, e), new Vector3d(length + t, t, t));
     }
 }

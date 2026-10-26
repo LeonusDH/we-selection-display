@@ -92,12 +92,14 @@ M = R(+X → n) · T(-t/2, -t/2, -t/2) · S(L + t, t, t)
 ```
 
 На Paper ту же матрицу можно передать в `BlockDisplay#setTransformationMatrix(Matrix4f)`.
+В Sponge API 12.0 нет `Keys.MATRIX` (он появился в 12.1), поэтому плагин передаёт ту же матрицу
+через `Keys.TRANSFORM`: как именно, расписано в комментарии к `ClientDisplays#transform`.
 
 **Видимость одному игроку.** В Sponge API нет способа скрыть сущность от конкретного игрока,
 поэтому `ClientDisplays` делает так:
 
 1. создаёт и настраивает `BlockDisplay` обычным Sponge API (`ServerWorld#createEntity` и ключи
-   `Keys.BLOCK_STATE`, `Keys.MATRIX`, `Keys.IS_GLOWING` и т. д.), но **не** добавляет его в мир;
+   `Keys.BLOCK_STATE`, `Keys.TRANSFORM`, `Keys.IS_GLOWING` и т. д.), но **не** добавляет его в мир;
 2. берёт из него id, UUID и синхронизируемые данные;
 3. отправляет игроку `ClientboundAddEntityPacket` и `ClientboundSetEntityDataPacket`, а для
    удаления — `ClientboundRemoveEntitiesPacket`; все пакеты одного обновления уходят одной
