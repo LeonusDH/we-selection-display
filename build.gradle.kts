@@ -41,6 +41,9 @@ sponge {
             optional(false)
         }
         dependency("worldedit") {
+            // Диапазон версий в формате Maven. WorldEdit для Sponge API 12 — это 7.3.6–7.3.8,
+            // версия в его метаданных выглядит как "7.3.8+<коммит>".
+            version("[7.3.6,)")
             loadOrder(PluginDependency.LoadOrder.AFTER)
             optional(false)
         }
