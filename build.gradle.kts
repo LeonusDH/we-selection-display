@@ -55,20 +55,14 @@ minecraft {
 }
 
 val javaTarget = 21
+
+// Сборка всегда идёт на JDK 21 (плагин нацелен на Minecraft 1.21.1), даже если сам Gradle
+// запущен на более новой Java. Недостающий JDK Gradle скачает сам через foojay (settings.gradle.kts).
 java {
-    sourceCompatibility = JavaVersion.toVersion(javaTarget)
-    targetCompatibility = JavaVersion.toVersion(javaTarget)
-    if (JavaVersion.current() < JavaVersion.toVersion(javaTarget)) {
-        toolchain.languageVersion.set(JavaLanguageVersion.of(javaTarget))
-    }
+    toolchain.languageVersion.set(JavaLanguageVersion.of(javaTarget))
 }
 
 tasks.withType(JavaCompile::class).configureEach {
     options.encoding = "UTF-8"
     options.release.set(javaTarget)
-}
-
-tasks.withType(AbstractArchiveTask::class).configureEach {
-    isReproducibleFileOrder = true
-    isPreserveFileTimestamps = false
 }
